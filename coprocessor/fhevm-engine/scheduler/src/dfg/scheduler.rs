@@ -15,8 +15,7 @@ use fhevm_engine_common::types::{Handle, SupportedFheCiphertexts};
 use fhevm_engine_common::utils::HeartBeat;
 use fhevm_engine_common::{common::FheOperation, telemetry};
 use opentelemetry::trace::{Span, Tracer};
-use prometheus::{register_histogram, Histogram};
-use std::{collections::HashMap, sync::atomic::AtomicUsize, sync::LazyLock};
+use std::collections::HashMap;
 use tfhe::ReRandomizationContext;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -199,6 +198,8 @@ impl<'a> Scheduler<'a> {
             let result = result?;
             let task_index = result.1;
             for (handle, node_result) in result.0.into_iter() {
+                let (sks, _cpk) = self.get_keys(DeviceSelection::RoundRobin)?;
+                tfhe::set_server_key(sks);
                 // Add computed allowed handles to the graph. These
                 // can be used as inputs and forwarded to subsequent,
                 // dependent transactions
@@ -258,13 +259,14 @@ fn re_randomise_transaction_inputs(
     );
     for txinput in inputs.values_mut() {
         match txinput {
-            Some(DFGTxInput::Value(val)) => {
+            Some(DFGTxInput::Value((val, true))) => {
                 val.add_to_re_randomization_context(&mut re_rand_context);
             }
-            Some(DFGTxInput::Compressed((t, c))) => {
+            Some(DFGTxInput::Value((_, false))) => {}
+            Some(DFGTxInput::Compressed(((t, c), allowed))) => {
                 let decomp = SupportedFheCiphertexts::decompress(*t, c, gpu_idx)?;
                 decomp.add_to_rerandomisation_context(&mut re_rand_context);
-                *txinput = Some(DFGTxInput::Value(decomp));
+                *txinput = Some(DFGTxInput::Value((decomp, *allowed)));
             }
             None => {
                 error!(target: "scheduler", { transaction_id = ?hex::encode(transaction_id) },
@@ -276,9 +278,10 @@ fn re_randomise_transaction_inputs(
     let mut seed_gen = re_rand_context.finalize();
     for txinput in inputs.values_mut() {
         match txinput {
-            Some(DFGTxInput::Value(ref mut val)) => {
+            Some(DFGTxInput::Value((ref mut val, true))) => {
                 val.re_randomise(&cpk, seed_gen.next_seed()?)?;
             }
+            Some(DFGTxInput::Value((_, false))) => {}
             Some(DFGTxInput::Compressed(_)) => {
                 error!(target: "scheduler", { transaction_id = ?hex::encode(transaction_id) },
 		       "Failed to re-randomise inputs for transaction");
@@ -303,9 +306,9 @@ fn decompress_transaction_inputs(
     for txinput in inputs.values_mut() {
         match txinput {
             Some(DFGTxInput::Value(_)) => {}
-            Some(DFGTxInput::Compressed((t, c))) => {
+            Some(DFGTxInput::Compressed(((t, c), allowed))) => {
                 let decomp = SupportedFheCiphertexts::decompress(*t, c, gpu_idx)?;
-                *txinput = Some(DFGTxInput::Value(decomp));
+                *txinput = Some(DFGTxInput::Value((decomp, *allowed)));
             }
             None => {
                 error!(target: "scheduler", { transaction_id = ?hex::encode(transaction_id) },
@@ -317,8 +320,9 @@ fn decompress_transaction_inputs(
     Ok(())
 }
 
+type TransactionMap = Vec<(DFGraph, HashMap<Handle, Option<DFGTxInput>>, Handle, usize)>;
 fn execute_partition(
-    transactions: Vec<(DFGraph, HashMap<Handle, Option<DFGTxInput>>, Handle, usize)>,
+    transactions: TransactionMap,
     task_id: NodeIndex,
     gpu_idx: usize,
     #[cfg(not(feature = "gpu"))] sks: tfhe::ServerKey,
@@ -356,7 +360,7 @@ fn execute_partition(
                     }
                     continue 'tx;
                 };
-                *i = Some(DFGTxInput::Value(ct.0.clone()));
+                *i = Some(DFGTxInput::Value((ct.0.clone(), ct.3)));
             }
         }
 
