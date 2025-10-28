@@ -1,7 +1,7 @@
 pub mod scheduler;
 pub mod types;
 
-use std::{collections::HashMap, sync::atomic::AtomicUsize};
+use std::{cmp::Ordering, collections::HashMap, sync::atomic::AtomicUsize};
 
 use crate::dfg::types::*;
 use anyhow::Result;
@@ -66,16 +66,71 @@ pub struct TxNode {
     // corresponding FHE op
     pub inputs: HashMap<Handle, Option<DFGTxInput>>,
     pub results: Vec<Handle>,
+    pub unneeded: Vec<Handle>,
     pub transaction_id: Handle,
     pub is_uncomputable: bool,
     pub component_id: usize,
 }
 
+fn is_needed(graph: &Dag<bool, OpEdge>, index: usize) -> bool {
+    let node_index = NodeIndex::new(index);
+    let node = graph.node_weight(node_index).unwrap();
+    if *node {
+        true
+    } else {
+        for edge in graph.edges_directed(node_index, Direction::Outgoing) {
+            // If any outgoing dependence is needed, so is this node
+            if is_needed(graph, edge.target().index()) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub fn finalize(graph: &mut Dag<bool, OpEdge>) -> Vec<usize> {
+    // Traverse in reverse order and mark nodes as needed as the
+    // graph order is roughly computable, so allowed nodes should
+    // generally be later in the graph.
+    for index in (0..graph.node_count()).rev() {
+        if is_needed(graph, index) {
+            let node = graph.node_weight_mut(NodeIndex::new(index)).unwrap();
+            *node = true;
+        }
+    }
+    // Prune graph of all unneeded nodes and edges
+    let mut unneeded_nodes = Vec::new();
+    for index in 0..graph.node_count() {
+        let node_index = NodeIndex::new(index);
+        let Some(node) = graph.node_weight(node_index) else {
+            continue;
+        };
+        if !*node {
+            println!("Dropping node {index}");
+            unneeded_nodes.push(index);
+        }
+    }
+    unneeded_nodes.sort();
+    // Remove unneeded nodes and their edges
+    for index in unneeded_nodes.iter().rev() {
+        let node_index = NodeIndex::new(*index);
+        let Some(node) = graph.node_weight(node_index) else {
+            continue;
+        };
+        if !*node {
+            graph.remove_node(node_index);
+        }
+    }
+    unneeded_nodes
+}
+
 pub fn build_component_nodes(
     mut operations: Vec<DFGOp>,
     transaction_id: &Handle,
-) -> Result<Vec<TxNode>> {
-    let mut graph: Dag<usize, OpEdge> = Dag::default();
+) -> Result<(Vec<TxNode>, Vec<(Handle, Handle)>)> {
+    operations.sort_by_key(|o| o.output_handle.clone());
+    println!("TX ops: {:?}", operations);
+    let mut graph: Dag<bool, OpEdge> = Dag::default();
     let mut produced_handles: HashMap<Handle, usize> = HashMap::new();
     let mut components: Vec<TxNode> = vec![];
     for (index, op) in operations.iter().enumerate() {
@@ -95,7 +150,7 @@ pub fn build_component_nodes(
                 DFGTaskInput::Value(_) | DFGTaskInput::Compressed(_) => {}
             }
         }
-        assert!(index == graph.add_node(index).index());
+        assert!(index == graph.add_node(op.is_allowed).index());
     }
     for (source, destination, pos) in dependence_pairs {
         // This returns an error in case of circular
@@ -104,7 +159,12 @@ pub fn build_component_nodes(
             .add_edge(node_index(source), node_index(destination), pos as u8)
             .map_err(|_| SchedulerError::CyclicDependence)?;
     }
-    // Prtition the graph and extract sequential components
+    // Prune unneeded branches from the graph
+    let unneeded: Vec<(Handle, Handle)> = finalize(&mut graph)
+        .into_iter()
+        .map(|i| (operations[i].output_handle.clone(), transaction_id.clone()))
+        .collect();
+    // Partition the graph and extract sequential components
     let mut execution_graph: Dag<ExecNode, ()> = Dag::default();
     partition_preserving_parallelism(&graph, &mut execution_graph)?;
     for idx in 0..execution_graph.node_count() {
@@ -120,7 +180,7 @@ pub fn build_component_nodes(
         component.build(component_ops, transaction_id, idx)?;
         components.push(component);
     }
-    Ok(components)
+    Ok((components, unneeded))
 }
 
 impl TxNode {

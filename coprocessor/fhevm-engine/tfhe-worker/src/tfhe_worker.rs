@@ -116,7 +116,7 @@ async fn tfhe_worker_cycle(
         s.end();
 
         // Query for transactions to execute, and if relevant the associated keys
-        let mut transactions =
+        let (mut transactions, mut unneeded_handles) =
             query_for_work(args, &health_check, &mut trx, &tracer, &loop_ctx).await?;
         if transactions.is_empty() {
             continue;
@@ -149,6 +149,7 @@ async fn tfhe_worker_cycle(
             upload_transaction_graph_results(
                 tenant_id,
                 &mut tx_graph,
+                &mut unneeded_handles,
                 &mut trx,
                 &tracer,
                 &loop_ctx,
@@ -290,7 +291,10 @@ async fn query_for_work<'a>(
     trx: &mut sqlx::Transaction<'a, Postgres>,
     tracer: &opentelemetry::global::BoxedTracer,
     loop_ctx: &opentelemetry::Context,
-) -> Result<Vec<(i32, Vec<TxNode>)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (Vec<(i32, Vec<TxNode>)>, Vec<(Handle, Handle)>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     // This query locks our work items so other worker doesn't select them.
     let mut s = tracer.start_with_context("query_work_items", loop_ctx);
     let the_work = query!(
@@ -337,9 +341,10 @@ FOR UPDATE SKIP LOCKED            ",
     health_check.update_db_access();
     if the_work.is_empty() {
         health_check.update_activity();
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     }
     WORK_ITEMS_FOUND_COUNTER.inc_by(the_work.len() as u64);
+    println!("GOT work: {:?}", the_work.len());
     info!(target: "tfhe_worker", { count = the_work.len() }, "Processing work items");
     // Make sure we process each tenant independently to avoid
     // setting different keys from different tenants in the worker
@@ -359,6 +364,7 @@ FOR UPDATE SKIP LOCKED            ",
     }
     // Traverse transactions and build transaction nodes
     let mut transactions: Vec<(i32, Vec<TxNode>)> = vec![];
+    let mut unneeded_handles: Vec<(Handle, Handle)> = vec![];
     for (tenant_id, work_by_transaction) in work_by_tenant_by_transaction.iter() {
         let mut tenant_transactions: Vec<TxNode> = vec![];
         for (transaction_id, txwork) in work_by_transaction.iter() {
@@ -397,13 +403,14 @@ FOR UPDATE SKIP LOCKED            ",
                     is_allowed: w.is_allowed,
                 });
             }
-            let mut components = build_component_nodes(ops, transaction_id)?;
+            let (mut components, mut unneeded) = build_component_nodes(ops, transaction_id)?;
             tenant_transactions.append(&mut components);
+            unneeded_handles.append(&mut unneeded);
         }
         transactions.push((*tenant_id, tenant_transactions));
     }
     s_prep.end();
-    Ok(transactions)
+    Ok((transactions, unneeded_handles))
 }
 
 async fn build_transaction_graph_and_execute<'a>(
@@ -433,6 +440,7 @@ async fn build_transaction_graph_and_execute<'a>(
         let keys = rk.get(tenant_id).expect("Can't get tenant key from cache");
         // Schedule computations in parallel as dependences allow
         tfhe::set_server_key(keys.sks.clone());
+        println!("  -- EXEC : {:?}", tx_graph);
         let mut sched = Scheduler::new(
             &mut tx_graph,
             keys.sks.clone(),
@@ -450,13 +458,15 @@ async fn build_transaction_graph_and_execute<'a>(
 async fn upload_transaction_graph_results<'a>(
     tenant_id: &i32,
     tx_graph: &mut DFTxGraph,
+    unneeded_handles: &mut Vec<(Handle, Handle)>,
     trx: &mut sqlx::Transaction<'a, Postgres>,
     tracer: &opentelemetry::global::BoxedTracer,
     loop_ctx: &opentelemetry::Context,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Get computation results
     let graph_results = tx_graph.get_results();
-    let handles_to_update = tx_graph.get_handles();
+    let mut handles_to_update = tx_graph.get_handles();
+    handles_to_update.append(unneeded_handles);
 
     // Traverse computations that have been scheduled and
     // upload their results/errors
