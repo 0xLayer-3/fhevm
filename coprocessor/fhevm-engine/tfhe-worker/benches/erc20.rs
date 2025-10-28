@@ -261,7 +261,7 @@ async fn schedule_erc20_whitepaper(
                 },
                 bals.clone(),
             ],
-            is_allowed: true,
+            is_allowed: false,
         });
     }
 
@@ -455,7 +455,7 @@ async fn schedule_erc20_no_cmux(
                     input: Some(Input::InputHandle(select_amount_handle.clone())),
                 },
             ],
-            is_allowed: true,
+            is_allowed: false,
         });
     }
 
@@ -665,7 +665,7 @@ async fn schedule_dependent_erc20_whitepaper(
                 },
                 bals.clone(),
             ],
-            is_allowed: true,
+            is_allowed: false,
         });
 
         bald = AsyncComputationInput {
@@ -886,7 +886,7 @@ async fn schedule_dependent_erc20_no_cmux(
                     input: Some(Input::InputHandle(select_amount_handle.clone())),
                 },
             ],
-            is_allowed: true,
+            is_allowed: false,
         });
 
         bald = AsyncComputationInput {
