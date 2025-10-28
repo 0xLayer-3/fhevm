@@ -227,6 +227,10 @@ contract GatewayConfig is IGatewayConfig, Ownable2StepUpgradeable, UUPSUpgradeab
         emit InitializeGatewayConfig(
             initialMetadata,
             initialMpcThreshold,
+            initialPublicDecryptionThreshold,
+            initialUserDecryptionThreshold,
+            initialKmsGenThreshold,
+            initialCoprocessorThreshold,
             initialKmsNodes,
             initialCoprocessors,
             initialCustodians
